@@ -361,11 +361,17 @@ defimpl DBConnection.Query, for: Jamdb.Oracle.Query do
   defp to_utc({date, time}),
     do: DateTime.from_naive!(to_naive({date, time}), "Etc/UTC")
 
-  defp to_date({{year, month, day}, {hour, min, sec}, tz}),
-    do: %DateTime{year: year, month: month, day: day, hour: hour, minute: min,
-	second: trunc(sec), microsecond: parse_sec(sec), time_zone: to_binary(tz),
-	zone_abbr: "UTC", utc_offset: 0, std_offset: 0}
-
+  defp to_date({{year, month, day}, {hour, min, sec}, tz}) do
+    # Hardcoded some values for now. See https://github.com/erlangbureau/jamdb_oracle/issues/153
+    offset = case tz do
+               '+01:00' -> 1
+               '+02:00' -> 2
+             end
+    %DateTime{year: year, month: month, day: day, hour: hour, minute: min,
+              second: trunc(sec), microsecond: parse_sec(sec), time_zone: "Etc/UTC",
+	      zone_abbr: "UTC", utc_offset: offset, std_offset: 0}
+  end
+  
   defp parse_sec(sec),
     do: {trunc((sec - trunc(sec)) * 1000000) , 6}
 
