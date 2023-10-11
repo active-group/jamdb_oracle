@@ -111,12 +111,30 @@ defmodule Jamdb.Oracle do
     {:ok, query, %{s | timeout: timeout}}
   end
 
+  defp autocommit_on!(s) do
+    # should not fail/can not fail? (it's an internal pseudo-query)
+    {:ok, _} = query(s, "COMON" |> Jamdb.Oracle.to_list)
+  end
+
+  defp autocommit_off!(s) do
+    # should not fail/can not fail? (it's an internal pseudo-query)
+    {:ok, _} = query(s, "COMOFF" |> Jamdb.Oracle.to_list)
+  end
+  
   @impl true
   def handle_begin(opts, %{mode: mode} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when mode == :idle ->
-        statement = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
-        handle_transaction(statement, opts, %{s | mode: :transaction})
+        autocommit_off!(s)
+        # TODO: both "work" kind of - find a way to test the difference; then decide what we want.
+        # statement = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+        statement = "SAVEPOINT tran"
+        case handle_transaction(statement, opts, %{s | mode: :transaction}) do
+          {:error, e, s} ->
+            autocommit_on!(s)
+            {:error, e, s}
+          otherwise -> otherwise
+        end
       :savepoint when mode == :transaction ->
         statement = "SAVEPOINT " <> Keyword.get(opts, :name, "svpt")
         handle_transaction(statement, opts, %{s | mode: :transaction})
@@ -129,6 +147,7 @@ defmodule Jamdb.Oracle do
   def handle_commit(opts, %{mode: mode} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when mode == :transaction ->
+        autocommit_on!(s)
         statement = "COMMIT"
         handle_transaction(statement, opts, %{s | mode: :idle})
       :savepoint when mode == :transaction ->
@@ -142,7 +161,8 @@ defmodule Jamdb.Oracle do
   def handle_rollback(opts, %{mode: mode} = s) do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when mode in [:transaction, :error] ->
-        statement = "ROLLBACK"
+        autocommit_on!(s)
+        statement = "ROLLBACK TO tran"
         handle_transaction(statement, opts, %{s | mode: :idle})
       :savepoint when mode in [:transaction, :error] ->
         statement = "ROLLBACK TO " <> Keyword.get(opts, :name, "svpt")
