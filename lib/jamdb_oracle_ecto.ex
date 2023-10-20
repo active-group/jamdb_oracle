@@ -75,10 +75,7 @@ defmodule Ecto.Adapters.Jamdb.Oracle do
   end
 
   @impl true
-  def storage_status(opts) do
-    database =
-      Keyword.fetch!(opts, :database) || raise ":database is nil in repository configuration"
-
+  def storage_status(_opts) do
     # we could not have a connection to a non-existing database anyway, so assume it's up
     {:ok, :up}
   end
