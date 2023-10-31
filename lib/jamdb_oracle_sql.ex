@@ -35,7 +35,7 @@ defmodule Jamdb.Oracle.SQL do
 
   def execute_ddl({command, %Index{} = index}) when command in [:create, :create_if_not_exists] do
     [[if_do(command == :create_if_not_exists, :begin),
-      "CREATE", if_do(index.unique, " UNIQUE"), " INDEX ", quote_name(index.name),
+      "CREATE", if_do(index.unique, " UNIQUE"), " INDEX ", quote_table(index.prefix, index.name),
       " ON ", quote_table(index.prefix, index.table), ?\s,
       ?(, intersperse_map(index.columns, ", ", &index_expr/1), ?),
       if_do(index.concurrently, " ONLINE"), options_expr(index.options),
@@ -58,7 +58,7 @@ defmodule Jamdb.Oracle.SQL do
   end
 
   def execute_ddl({:rename, %Index{} = current_index, new_name}) do
-    [["ALTER INDEX ", quote_name(current_index.name), " RENAME TO ", quote_name(new_name)]]
+    [["ALTER INDEX ", quote_table(current_index.prefix, current_index.name), " RENAME TO ", quote_table(current_index.prefix, new_name)]]
   end
 
   def execute_ddl({command, %Constraint{} = constraint}) when command in [:create, :create_if_not_exists] do
