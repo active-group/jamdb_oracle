@@ -19,6 +19,7 @@ defmodule Ecto.Adapters.Jamdb.Oracle do
   def loaders({:array, _}, type), do: [&array_decode/1, type]
   def loaders({:embed, _}, type), do: [&json_decode/1, &Ecto.Type.embedded_load(type, &1, :json)]
   def loaders({:map, _}, type),   do: [&json_decode/1, &Ecto.Type.embedded_load(type, &1, :json)]
+  def loaders(:json, type),       do: [&json_decode/1, type]
   def loaders(:map, type),        do: [&json_decode/1, type]
   def loaders(:float, type),      do: [&float_decode/1, type]
   def loaders(:boolean, type),    do: [&bool_decode/1, type]
