@@ -52,7 +52,7 @@ defmodule Jamdb.Oracle do
       {:ok, [{:proc_result, _, msg}], conn} -> {:error, msg, %{s | conn: conn}}
       {:ok, [{:affected_rows, num_rows}], conn} -> {:ok, %{num_rows: num_rows, rows: nil}, %{s | conn: conn}}
       {:ok, result, conn} -> {:ok, result, %{s | conn: conn}}
-      {:error, err, conn} -> {:disconnect, err, conn}
+      {:error, err, conn} -> {:disconnect, err, %{s | conn: conn}}
     end
   end
 
