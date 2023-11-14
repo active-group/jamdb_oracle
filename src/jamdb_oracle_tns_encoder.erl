@@ -7,6 +7,8 @@
 -export([encode_str/1]).
 -export([encode_helper/2]).
 
+-import(jamdb_oracle_conn, [mvar_get/1]).
+
 -include("jamdb_oracle.hrl").
 
 %% API
@@ -86,8 +88,7 @@ encode_record(auth, #oraclient{env=EnvOpts,passwd=Passwd,req=Request,seq=Tseq}) 
     User            = proplists:get_value(user, EnvOpts),
     Role            = proplists:get_value(role, EnvOpts, 0),
     Prelim          = proplists:get_value(prelim, EnvOpts, 0),
-    Passwd ! {get, self()},
-    {Pass, NewPass} = receive Reply -> Reply end,
+    {Pass, NewPass} = mvar_get(Passwd),
     User2 = encode_str(User),
     Pass2 = binary_to_list(encode_str(Pass)),
     NewPass2 = binary_to_list(encode_str(NewPass)),
