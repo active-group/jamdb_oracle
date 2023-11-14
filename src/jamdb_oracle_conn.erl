@@ -5,6 +5,7 @@
 -export([reconnect/1]).
 -export([disconnect/1, disconnect/2]).
 -export([sql_query/2, sql_query/3]).
+-export([mvar_get/1]).
 
 -include("jamdb_oracle.hrl").
 
@@ -51,7 +52,7 @@ connect(Opts, Tout) ->
     Pass        = proplists:get_value(password, Opts),
     NewPass     = proplists:get_value(newpassword, Opts, []),
     EnvOpts     = proplists:delete(password, proplists:delete(newpassword, Opts)),
-    Passwd = spawn(fun() -> loop({Pass, NewPass}) end),
+    Passwd = mvar_spawn({Pass, NewPass}),
     case gen_tcp:connect(Host, Port, SockOpts, Tout) of
         {ok, Socket} ->
             {ok, Socket2} = sock_connect(Socket, SslOpts, Tout),
@@ -66,20 +67,19 @@ connect(Opts, Tout) ->
 -spec disconnect(state()) -> {ok, [env()]}.
 disconnect(#oraclient{socket=Socket, env=Env, passwd=Passwd}) ->
     sock_close(Socket),
-    freeval(Passwd),
+    mvar_free(Passwd),
     {ok, Env}.
 
 -spec disconnect(state(), timeout()) -> {ok, []}.
 disconnect(#oraclient{socket=Socket, passwd=Passwd} = State, _Tout) ->
     send_req(close, State),
     sock_close(Socket),
-    freeval(Passwd),
+    mvar_free(Passwd),
     {ok, []}.
 
 -spec reconnect(state()) -> empty_result().
 reconnect(#oraclient{passwd=Passwd} = State) ->
-    Passwd ! {get, self()},
-    {Pass, NewPass} = receive Reply -> Reply end,
+    {Pass, NewPass} = mvar_get(Passwd),
     {ok, EnvOpts} = disconnect(State),
     Pass2 = if NewPass =/= [] -> NewPass; true -> Pass end,
     connect([{password, Pass2}|EnvOpts]).
@@ -122,8 +122,25 @@ sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, 
         _ -> {ok, undefined, State}
     end.
 
-loop(Values) ->
-    receive {get, From} -> From ! Values, loop(Values); {set, Values2} -> loop(Values2) end.
+mvar_spawn(Init) ->
+    % TODO: high risk of memory leaks. Should link to something.
+    spawn(fun() -> mvar_loop(Init) end).
+
+mvar_free(undefined) -> true;
+mvar_free(Pid) when is_pid(Pid) -> exit(Pid, ok).
+
+mvar_loop(Value) ->
+    receive
+        {get, From, Key} -> From ! {Key, Value}, mvar_loop(Value);
+        {set, Value2} -> mvar_loop(Value2) end.
+
+mvar_get(Pid) ->
+    Self = self(),
+    Pid ! {get, Self, Pid},
+    receive {Pid, Res} -> Res end.
+
+mvar_set(Pid, V) ->
+    Pid ! {set, V}.
 
 %% internal
 handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = State) ->
@@ -141,7 +158,7 @@ handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = St
             {ok, State2} = send_req(login, State#oraclient{socket=Socket2}),
             handle_login(State2);
         {ok, ?TNS_ACCEPT, <<_Ver:16,_Opts:16,Sdu:16,_Rest/bits>> = _BinaryData} ->
-            Task = spawn(fun() -> loop(0) end),
+            Task = mvar_spawn(0),
             {ok, State2} = send_req(pro, State#oraclient{seq=Task,sdu=Sdu}),
             handle_login(State2);
         {ok, ?TNS_MARKER, _BinaryData} ->
@@ -162,7 +179,7 @@ handle_token(<<Token, Data/binary>>, State) ->
                     send_req(auth, State#oraclient{req=Request});
                 {?TTI_AUTH, Resp, Ver, SessId} ->
                     #oraclient{auth = KeyConn} = State,
-                    Cursors = spawn(fun() -> loop([]) end),
+                    Cursors = mvar_spawn([]),
                     case jamdb_oracle_crypt:validate(#logon{auth=Resp, key=KeyConn}) of
                         ok -> State#oraclient{conn_state=connected,auth=SessId,server=Ver,cursors=Cursors};
                         error -> handle_error(remote, Resp, State)
@@ -228,18 +245,18 @@ send_req(auth, #oraclient{req=Request,seq=Task} = State) ->
     {Data, KeyConn} = get_record(auth, State, Request, Task),
     send(State#oraclient{auth=KeyConn,req=[]}, ?TNS_DATA, Data);
 send_req(close, #oraclient{server=0,seq=Task} = State) ->
-    freeval(Task),
+    mvar_free(Task),
     send(State, ?TNS_DATA, <<64>>);
 send_req(close, #oraclient{auto=0} = State) ->
     _ = handle_req(tran, State, ?TTI_ROLLBACK),
     send_req(close, State#oraclient{auto=1});
 send_req(close, #oraclient{cursors=Cursors} = State) ->
     _ = handle_req(pig, State, {close, 0}),
-    freeval(Cursors),
+    mvar_free(Cursors),
     send_req(close, State#oraclient{server=0});
 send_req(reset, #oraclient{cursors=Cursors} = State) ->
     handle_req(pig, State, {tran, ?TTI_PING}),
-    Cursors ! {set, []};
+    mvar_set(Cursors, []);
 send_req(Type, #oraclient{req=Request,seq=Task} = State) ->
     Data = get_record(Type, State, Request, Task),
     send(State, ?TNS_DATA, Data).
@@ -331,25 +348,25 @@ get_result(_Type, _RetCode, _RowNumber, _RowFormat, _Rows) ->
     more.
 
 get_result(undefined) -> [];
-get_result(Cursors) when is_pid(Cursors) -> Cursors ! {get, self()}, receive Reply -> Reply end;
+get_result(Cursors) when is_pid(Cursors) -> mvar_get(Cursors);
 get_result(#format{column_name=Column}) -> Column.
-
-freeval(undefined) -> true;
-freeval(Pid) when is_pid(Pid) -> exit(Pid, ok).
 
 currval({Sum, {0, _Cursor, _RowFormat}}, Result, Cursors) when is_pid(Cursors) ->
     Acc = get_result(Cursors),
     DefCol = {Sum, Result},
     case length(Acc) > 127 of
         true -> {reset, DefCol};
-        _ -> Cursors ! {set, [DefCol|Acc]}, {more, DefCol}
+        _ -> mvar_set(Cursors, [DefCol|Acc]), {more, DefCol}
     end;
 currval(DefCol, _Result, _Cursors) -> {more, DefCol}.
 
 nextval(Task) when is_pid(Task) ->
-    Task ! {get, self()},
-    Tseq = receive 127 -> 0; Reply -> Reply end,
-    Task ! {set, Tseq + 1}, Tseq + 1;
+    Tseq = case mvar_get(Task) of
+      127 -> 0;
+      V -> V
+    end,
+    mvar_set(Task, Tseq + 1),
+    Tseq + 1;
 nextval(Tseq) -> Tseq.
 
 get_param(format, {out, Data}, Format) -> get_param(out, ?ENCODER:encode_helper(param, Data), Format);
