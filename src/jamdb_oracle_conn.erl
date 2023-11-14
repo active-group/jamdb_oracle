@@ -5,7 +5,6 @@
 -export([reconnect/1]).
 -export([disconnect/1, disconnect/2]).
 -export([sql_query/2, sql_query/3]).
--export([mvar_get/1]).
 
 -include("jamdb_oracle.hrl").
 
@@ -52,7 +51,7 @@ connect(Opts, Tout) ->
     Pass        = proplists:get_value(password, Opts),
     NewPass     = proplists:get_value(newpassword, Opts, []),
     EnvOpts     = proplists:delete(password, proplists:delete(newpassword, Opts)),
-    Passwd = mvar_spawn({Pass, NewPass}),
+    Passwd = {Pass, NewPass},
     case gen_tcp:connect(Host, Port, SockOpts, Tout) of
         {ok, Socket} ->
             {ok, Socket2} = sock_connect(Socket, SslOpts, Tout),
@@ -65,21 +64,19 @@ connect(Opts, Tout) ->
     end.
 
 -spec disconnect(state()) -> {ok, [env()]}.
-disconnect(#oraclient{socket=Socket, env=Env, passwd=Passwd}) ->
+disconnect(#oraclient{socket=Socket, env=Env}) ->
     sock_close(Socket),
-    mvar_free(Passwd),
     {ok, Env}.
 
 -spec disconnect(state(), timeout()) -> {ok, []}.
-disconnect(#oraclient{socket=Socket, passwd=Passwd} = State, _Tout) ->
+disconnect(#oraclient{socket=Socket} = State, _Tout) ->
     send_req(close, State),
     sock_close(Socket),
-    mvar_free(Passwd),
     {ok, []}.
 
 -spec reconnect(state()) -> empty_result().
 reconnect(#oraclient{passwd=Passwd} = State) ->
-    {Pass, NewPass} = mvar_get(Passwd),
+    {Pass, NewPass} = Passwd,
     {ok, EnvOpts} = disconnect(State),
     Pass2 = if NewPass =/= [] -> NewPass; true -> Pass end,
     connect([{password, Pass2}|EnvOpts]).
