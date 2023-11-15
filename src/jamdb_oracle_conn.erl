@@ -24,6 +24,8 @@
 -type query_result() :: {ok, [result()], state()}.
 -type options() :: [env()].
 
+-record(seq, {v}).
+
 -export_type([state/0]).
 -export_type([options/0]).
 
@@ -111,9 +113,15 @@ sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, 
         "COMOFF" -> handle_req(tran, State#oraclient{auto=0}, ?TTI_COMOFF);
         "PING" -> handle_req(tran, State, ?TTI_PING);
         "STOP" -> handle_req(stop, State, hd(Bind));
-        "START" -> handle_req(spfp, State, []), handle_req(start, State, hd(Bind));
-        "CLOSE" -> send_req(close, State), handle_error(local, [], State);
-        "CURRESET" -> send_req(reset, State), {ok, [], State};
+        "START" ->
+            handle_req(spfp, State, []),  %% TODO no threading of State?
+            handle_req(start, State, hd(Bind));
+        "CLOSE" ->
+            send_req(close, State),   %% TODO no threading of State?
+            handle_error(local, [], State);
+        "CURRESET" ->
+            send_req(reset, State),  %% TODO thread State?
+            {ok, [], State};
         "TIMEOUT" -> {ok, [], State#oraclient{timeouts={hd(Bind), ReadTout}}};
         "FETCH" -> {ok, [], State#oraclient{fetch=hd(Bind)}};
         _ -> {ok, undefined, State}
@@ -155,8 +163,7 @@ handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = St
             {ok, State2} = send_req(login, State#oraclient{socket=Socket2}),
             handle_login(State2);
         {ok, ?TNS_ACCEPT, <<_Ver:16,_Opts:16,Sdu:16,_Rest/bits>> = _BinaryData} ->
-            Task = mvar_spawn(0),
-            {ok, State2} = send_req(pro, State#oraclient{seq=Task,sdu=Sdu}),
+            {ok, State2} = send_req(pro, State#oraclient{seq=#seq{v=0},sdu=Sdu}),
             handle_login(State2);
         {ok, ?TNS_MARKER, _BinaryData} ->
             handle_req(marker, State, []);
@@ -209,19 +216,19 @@ handle_bind(Select, Change, Data, Bind) when is_list(Bind) ->
 handle_bind(Select, Change, Data, Bind) when is_map(Bind) ->
     {Select, Change, lists:map(fun(L) -> maps:get(list_to_atom(L), Bind) end, Data)}.
 
-handle_req(pig, #oraclient{cursors=Cursors,seq=Task} = State, {Type, Request}) ->
+handle_req(pig, #oraclient{cursors=Cursors,seq=Seq} = State, {Type, Request}) ->
     {LPig, LPig2} = unzip([get_param(defcols, DefCol) || DefCol <- get_result(Cursors)]),
-    Pig = if LPig =/= [] -> get_record(pig, [], {?TTI_CANA, LPig}, Task); true -> <<>> end,
-    Pig2 = if LPig2 =/= [] -> get_record(pig, [], {?TTI_OCCA, LPig2}, Task); true -> <<>> end,
-    Data = get_record(Type, [], Request, Task),
-    handle_req(State, ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>, []);
+    {Pig, Seq2} = if LPig =/= [] -> get_record(pig, [], {?TTI_CANA, LPig}, Seq); true -> {<<>>, Seq} end,
+    {Pig2, Seq3} = if LPig2 =/= [] -> get_record(pig, [], {?TTI_OCCA, LPig2}, Seq2); true -> {<<>>, Seq2} end,
+    {Data, Seq4} = get_record(Type, [], Request, Seq3),
+    handle_req(State#oraclient{seq=Seq4}, ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>, []);
 handle_req(marker, State, Acc) ->
     handle_req(State, ?TNS_MARKER, <<1,0,2>>, Acc);
 handle_req(fob, State, Acc) ->
     handle_req(State, ?TNS_DATA, <<?TTI_FOB>>, Acc);
-handle_req(Type, #oraclient{seq=Task} = State, Request) ->
-    Data = get_record(Type, [], Request, Task),
-    handle_req(State, ?TNS_DATA, Data, []).
+handle_req(Type, #oraclient{seq=Seq} = State, Request) ->
+    {Data, Seq2} = get_record(Type, [], Request, Seq),
+    handle_req(State#oraclient{seq=Seq2}, ?TNS_DATA, Data, []).
 
 handle_req(State, PacketType, Data, Acc) ->
     case send(State, PacketType, Data) of
@@ -236,13 +243,12 @@ unzip([{X, Y} | Ts], Xs, Ys) -> unzip(Ts, [X | Xs], [Y | Ys]);
 unzip([], Xs, Ys) -> {Ys, Ys ++ Xs}.
 
 send_req(login, State) ->
-    Data = get_record(login, State, [], 0),
+    {Data, _} = get_record(login, State, [], 0),
     send(State, ?TNS_CONNECT, Data);
-send_req(auth, #oraclient{req=Request,seq=Task} = State) ->
-    {Data, KeyConn} = get_record(auth, State, Request, Task),
-    send(State#oraclient{auth=KeyConn,req=[]}, ?TNS_DATA, Data);
-send_req(close, #oraclient{server=0,seq=Task} = State) ->
-    mvar_free(Task),
+send_req(auth, #oraclient{req=Request,seq=Seq} = State) ->
+    {{Data, KeyConn}, Seq2} = get_record(auth, State, Request, Seq),
+    send(State#oraclient{auth=KeyConn,req=[],seq=Seq2}, ?TNS_DATA, Data);
+send_req(close, #oraclient{server=0} = State) ->
     send(State, ?TNS_DATA, <<64>>);
 send_req(close, #oraclient{auto=0} = State) ->
     _ = handle_req(tran, State, ?TTI_ROLLBACK),
@@ -252,29 +258,30 @@ send_req(close, #oraclient{cursors=Cursors} = State) ->
     mvar_free(Cursors),
     send_req(close, State#oraclient{server=0});
 send_req(reset, #oraclient{cursors=Cursors} = State) ->
-    handle_req(pig, State, {tran, ?TTI_PING}),
-    mvar_set(Cursors, []);
-send_req(Type, #oraclient{req=Request,seq=Task} = State) ->
-    Data = get_record(Type, State, Request, Task),
-    send(State, ?TNS_DATA, Data).
+    Res = handle_req(pig, State, {tran, ?TTI_PING}),
+    mvar_set(Cursors, []),
+    Res;
+send_req(Type, #oraclient{req=Request,seq=Seq} = State) ->
+    {Data, Seq2} = get_record(Type, State, Request, Seq),
+    send(State#oraclient{seq=Seq2}, ?TNS_DATA, Data).
 
-send_req(fetch, #oraclient{seq=Task} = State, {Cursor, RowFormat}) ->
-    Data = get_record(exec, State#oraclient{type=fetch}, {Cursor, [], [], [], RowFormat}, Task),
-    send(State, ?TNS_DATA, Data);
-send_req(fetch, #oraclient{seq=Task} = State, Cursor) ->
-    Data = get_record(fetch, State, Cursor, Task),
-    send(State, ?TNS_DATA, Data);
-send_req(exec, #oraclient{charset=Charset,fetch=Fetch,cursors=Cursors,seq=Task} = State, {Query, Bind, Batch}) ->
+send_req(fetch, #oraclient{seq=Seq} = State, {Cursor, RowFormat}) ->
+    {Data, Seq2} = get_record(exec, State#oraclient{type=fetch}, {Cursor, [], [], [], RowFormat}, Seq),
+    send(State#oraclient{seq=Seq2}, ?TNS_DATA, Data);
+send_req(fetch, #oraclient{seq=Seq} = State, Cursor) ->
+    {Data, Seq2} = get_record(fetch, State, Cursor, Seq),
+    send(State#oraclient{seq=Seq2}, ?TNS_DATA, Data);
+send_req(exec, #oraclient{charset=Charset,fetch=Fetch,cursors=Cursors,seq=Seq} = State, {Query, Bind, Batch}) ->
     {Select, Change, Bind2} = handle_bind(Query, Bind),
     {Type, Fetch2} = get_param(type, {Select, Change, [B || {out, B} <- Bind2], Fetch}),
     Sum = erlang:crc32(?ENCODER:encode_str(Query)),
     DefCol = get_param(defcols, {Sum, Cursors}),
     {LCursor, Cursor} = get_param(defcols, DefCol),
-    Pig = if Cursor =/= 0 -> get_record(pig, [], {?TTI_CANA, [Cursor]}, Task); true -> <<>> end,
-    Pig2 = if Cursor =/= 0 -> get_record(pig, [], {?TTI_OCCA, [Cursor]}, Task); true -> <<>> end,
-    Data = get_record(exec, State#oraclient{type=Type,fetch=Fetch2}, {LCursor, if LCursor =:= 0 -> Query; true -> [] end,
-        [get_param(data, B) || B <- Bind2], Batch, []}, Task),
-    send(State#oraclient{type=Type,defcols=DefCol,params=[get_param(format, B, #format{charset=Charset}) || B <- Bind2]},
+    {Pig, Seq2} = if Cursor =/= 0 -> get_record(pig, [], {?TTI_CANA, [Cursor]}, Seq); true -> {<<>>, Seq} end,
+    {Pig2, Seq3} = if Cursor =/= 0 -> get_record(pig, [], {?TTI_OCCA, [Cursor]}, Seq2); true -> {<<>>, Seq2} end,
+    {Data, Seq4} = get_record(exec, State#oraclient{type=Type,fetch=Fetch2}, {LCursor, if LCursor =:= 0 -> Query; true -> [] end,
+        [get_param(data, B) || B <- Bind2], Batch, []}, Seq3),
+    send(State#oraclient{type=Type,defcols=DefCol,params=[get_param(format, B, #format{charset=Charset}) || B <- Bind2],seq=Seq4},
         ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>).
 
 handle_resp(Acc, #oraclient{socket=Socket, sdu=Length, timeouts=Touts} = State) ->
@@ -357,14 +364,15 @@ currval({Sum, {0, _Cursor, _RowFormat}}, Result, Cursors) when is_pid(Cursors) -
     end;
 currval(DefCol, _Result, _Cursors) -> {more, DefCol}.
 
-nextval(Task) when is_pid(Task) ->
-    Tseq = case mvar_get(Task) of
+nextval(#seq{v=V}) ->
+    Tseq = case V of
       127 -> 0;
       V -> V
     end,
-    mvar_set(Task, Tseq + 1),
-    Tseq + 1;
-nextval(Tseq) -> Tseq.
+    Tseq2 = Tseq + 1,
+    {Tseq2, #seq{v=Tseq2}};
+nextval(Tseq) ->
+    {Tseq, Tseq}.
 
 get_param(format, {out, Data}, Format) -> get_param(out, ?ENCODER:encode_helper(param, Data), Format);
 get_param(format, {in, Data}, Format) -> get_param(in, Data, Format);
@@ -394,10 +402,12 @@ get_param(data, {out, Data}) -> ?ENCODER:encode_helper(param, Data);
 get_param(data, {in, Data}) -> Data;
 get_param(data, Data) -> Data.
 
-get_record(Type, [], Request, Task) ->
-    ?ENCODER:encode_record(Type, #oraclient{req=Request, seq=nextval(Task)});
-get_record(Type, State, Request, Task) ->
-    ?ENCODER:encode_record(Type, State#oraclient{req=Request, seq=nextval(Task)}).
+get_record(Type, [], Request, Seq) ->
+    {Tseq, Seq2} = nextval(Seq),
+    {?ENCODER:encode_record(Type, #oraclient{req=Request, seq=Tseq}), Seq2};
+get_record(Type, State, Request, Seq) ->
+    {Tseq, Seq2} = nextval(Seq),
+    {?ENCODER:encode_record(Type, State#oraclient{req=Request, seq=Tseq}), Seq2}.
 
 sock_renegotiate(Socket, _Opts, _Touts) when is_port(Socket) -> {ok, Socket};
 sock_renegotiate(Socket, Opts, {Tout, _ReadTout}) ->
