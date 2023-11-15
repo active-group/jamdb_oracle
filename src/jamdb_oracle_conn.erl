@@ -5,7 +5,6 @@
 -export([reconnect/1]).
 -export([disconnect/1, disconnect/2]).
 -export([sql_query/2, sql_query/3]).
--export([mvar_get/1]).
 
 -include("jamdb_oracle.hrl").
 
@@ -24,6 +23,9 @@
 -type result() :: fetched_rows() | affected_rows() | result_set() | procedure_result().
 -type query_result() :: {ok, [result()], state()}.
 -type options() :: [env()].
+
+-record(seq, {v}).
+-record(cursors, {v}).
 
 -export_type([state/0]).
 -export_type([options/0]).
@@ -52,7 +54,7 @@ connect(Opts, Tout) ->
     Pass        = proplists:get_value(password, Opts),
     NewPass     = proplists:get_value(newpassword, Opts, []),
     EnvOpts     = proplists:delete(password, proplists:delete(newpassword, Opts)),
-    Passwd = mvar_spawn({Pass, NewPass}),
+    Passwd = {Pass, NewPass},
     case gen_tcp:connect(Host, Port, SockOpts, Tout) of
         {ok, Socket} ->
             {ok, Socket2} = sock_connect(Socket, SslOpts, Tout),
@@ -65,21 +67,19 @@ connect(Opts, Tout) ->
     end.
 
 -spec disconnect(state()) -> {ok, [env()]}.
-disconnect(#oraclient{socket=Socket, env=Env, passwd=Passwd}) ->
+disconnect(#oraclient{socket=Socket, env=Env}) ->
     sock_close(Socket),
-    mvar_free(Passwd),
     {ok, Env}.
 
 -spec disconnect(state(), timeout()) -> {ok, []}.
-disconnect(#oraclient{socket=Socket, passwd=Passwd} = State, _Tout) ->
+disconnect(#oraclient{socket=Socket} = State, _Tout) ->
     send_req(close, State),
     sock_close(Socket),
-    mvar_free(Passwd),
     {ok, []}.
 
 -spec reconnect(state()) -> empty_result().
 reconnect(#oraclient{passwd=Passwd} = State) ->
-    {Pass, NewPass} = mvar_get(Passwd),
+    {Pass, NewPass} = Passwd,
     {ok, EnvOpts} = disconnect(State),
     Pass2 = if NewPass =/= [] -> NewPass; true -> Pass end,
     connect([{password, Pass2}|EnvOpts]).
@@ -114,33 +114,19 @@ sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, 
         "COMOFF" -> handle_req(tran, State#oraclient{auto=0}, ?TTI_COMOFF);
         "PING" -> handle_req(tran, State, ?TTI_PING);
         "STOP" -> handle_req(stop, State, hd(Bind));
-        "START" -> handle_req(spfp, State, []), handle_req(start, State, hd(Bind));
-        "CLOSE" -> send_req(close, State), handle_error(local, [], State);
-        "CURRESET" -> send_req(reset, State), {ok, [], State};
+        "START" ->
+            handle_req(spfp, State, []),  %% TODO why no threading of State?
+            handle_req(start, State, hd(Bind));
+        "CLOSE" ->
+            send_req(close, State),   %% TODO why no threading of State?
+            handle_error(local, [], State);
+        "CURRESET" ->
+            State2 = send_reset(State),
+            {ok, [], State2};
         "TIMEOUT" -> {ok, [], State#oraclient{timeouts={hd(Bind), ReadTout}}};
         "FETCH" -> {ok, [], State#oraclient{fetch=hd(Bind)}};
         _ -> {ok, undefined, State}
     end.
-
-mvar_spawn(Init) ->
-    % TODO: high risk of memory leaks. Should link to something.
-    spawn(fun() -> mvar_loop(Init) end).
-
-mvar_free(undefined) -> true;
-mvar_free(Pid) when is_pid(Pid) -> exit(Pid, ok).
-
-mvar_loop(Value) ->
-    receive
-        {get, From, Key} -> From ! {Key, Value}, mvar_loop(Value);
-        {set, Value2} -> mvar_loop(Value2) end.
-
-mvar_get(Pid) ->
-    Self = self(),
-    Pid ! {get, Self, Pid},
-    receive {Pid, Res} -> Res end.
-
-mvar_set(Pid, V) ->
-    Pid ! {set, V}.
 
 %% internal
 handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = State) ->
@@ -158,8 +144,7 @@ handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = St
             {ok, State2} = send_req(login, State#oraclient{socket=Socket2}),
             handle_login(State2);
         {ok, ?TNS_ACCEPT, <<_Ver:16,_Opts:16,Sdu:16,_Rest/bits>> = _BinaryData} ->
-            Task = mvar_spawn(0),
-            {ok, State2} = send_req(pro, State#oraclient{seq=Task,sdu=Sdu}),
+            {ok, State2} = send_req(pro, State#oraclient{seq=#seq{v=0},sdu=Sdu}),
             handle_login(State2);
         {ok, ?TNS_MARKER, _BinaryData} ->
             handle_req(marker, State, []);
@@ -179,9 +164,8 @@ handle_token(<<Token, Data/binary>>, State) ->
                     send_req(auth, State#oraclient{req=Request});
                 {?TTI_AUTH, Resp, Ver, SessId} ->
                     #oraclient{auth = KeyConn} = State,
-                    Cursors = mvar_spawn([]),
                     case jamdb_oracle_crypt:validate(#logon{auth=Resp, key=KeyConn}) of
-                        ok -> State#oraclient{conn_state=connected,auth=SessId,server=Ver,cursors=Cursors};
+                        ok -> State#oraclient{conn_state=connected,auth=SessId,server=Ver,cursors=#cursors{v=[]}};
                         error -> handle_error(remote, Resp, State)
                     end
             end;
@@ -212,19 +196,19 @@ handle_bind(Select, Change, Data, Bind) when is_list(Bind) ->
 handle_bind(Select, Change, Data, Bind) when is_map(Bind) ->
     {Select, Change, lists:map(fun(L) -> maps:get(list_to_atom(L), Bind) end, Data)}.
 
-handle_req(pig, #oraclient{cursors=Cursors,seq=Task} = State, {Type, Request}) ->
+handle_req(pig, #oraclient{cursors=Cursors,seq=Seq} = State, {Type, Request}) ->
     {LPig, LPig2} = unzip([get_param(defcols, DefCol) || DefCol <- get_result(Cursors)]),
-    Pig = if LPig =/= [] -> get_record(pig, [], {?TTI_CANA, LPig}, Task); true -> <<>> end,
-    Pig2 = if LPig2 =/= [] -> get_record(pig, [], {?TTI_OCCA, LPig2}, Task); true -> <<>> end,
-    Data = get_record(Type, [], Request, Task),
-    handle_req(State, ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>, []);
+    {Pig, Seq2} = if LPig =/= [] -> get_record(pig, [], {?TTI_CANA, LPig}, Seq); true -> {<<>>, Seq} end,
+    {Pig2, Seq3} = if LPig2 =/= [] -> get_record(pig, [], {?TTI_OCCA, LPig2}, Seq2); true -> {<<>>, Seq2} end,
+    {Data, Seq4} = get_record(Type, [], Request, Seq3),
+    handle_req(State#oraclient{seq=Seq4}, ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>, []);
 handle_req(marker, State, Acc) ->
     handle_req(State, ?TNS_MARKER, <<1,0,2>>, Acc);
 handle_req(fob, State, Acc) ->
     handle_req(State, ?TNS_DATA, <<?TTI_FOB>>, Acc);
-handle_req(Type, #oraclient{seq=Task} = State, Request) ->
-    Data = get_record(Type, [], Request, Task),
-    handle_req(State, ?TNS_DATA, Data, []).
+handle_req(Type, #oraclient{seq=Seq} = State, Request) ->
+    {Data, Seq2} = get_record(Type, [], Request, Seq),
+    handle_req(State#oraclient{seq=Seq2}, ?TNS_DATA, Data, []).
 
 handle_req(State, PacketType, Data, Acc) ->
     case send(State, PacketType, Data) of
@@ -239,45 +223,45 @@ unzip([{X, Y} | Ts], Xs, Ys) -> unzip(Ts, [X | Xs], [Y | Ys]);
 unzip([], Xs, Ys) -> {Ys, Ys ++ Xs}.
 
 send_req(login, State) ->
-    Data = get_record(login, State, [], 0),
+    {Data, _} = get_record(login, State, [], 0),
     send(State, ?TNS_CONNECT, Data);
-send_req(auth, #oraclient{req=Request,seq=Task} = State) ->
-    {Data, KeyConn} = get_record(auth, State, Request, Task),
-    send(State#oraclient{auth=KeyConn,req=[]}, ?TNS_DATA, Data);
-send_req(close, #oraclient{server=0,seq=Task} = State) ->
-    mvar_free(Task),
+send_req(auth, #oraclient{req=Request,seq=Seq} = State) ->
+    {{Data, KeyConn}, Seq2} = get_record(auth, State, Request, Seq),
+    send(State#oraclient{auth=KeyConn,req=[],seq=Seq2}, ?TNS_DATA, Data);
+send_req(close, #oraclient{server=0} = State) ->
     send(State, ?TNS_DATA, <<64>>);
 send_req(close, #oraclient{auto=0} = State) ->
     _ = handle_req(tran, State, ?TTI_ROLLBACK),
     send_req(close, State#oraclient{auto=1});
-send_req(close, #oraclient{cursors=Cursors} = State) ->
+send_req(close, State) ->
     _ = handle_req(pig, State, {close, 0}),
-    mvar_free(Cursors),
     send_req(close, State#oraclient{server=0});
-send_req(reset, #oraclient{cursors=Cursors} = State) ->
-    handle_req(pig, State, {tran, ?TTI_PING}),
-    mvar_set(Cursors, []);
-send_req(Type, #oraclient{req=Request,seq=Task} = State) ->
-    Data = get_record(Type, State, Request, Task),
-    send(State, ?TNS_DATA, Data).
+send_req(reset, State) ->
+    case handle_req(pig, State, {tran, ?TTI_PING}) of
+        {ok, Result, State2} -> {ok, Result, State2#oraclient{cursors = #cursors{v=[]}}};
+        {error, Type, Reason, State2} -> {error, Type, Reason, State2#oraclient{cursors = #cursors{v=[]}}}
+    end;
+send_req(Type, #oraclient{req=Request,seq=Seq} = State) ->
+    {Data, Seq2} = get_record(Type, State, Request, Seq),
+    send(State#oraclient{seq=Seq2}, ?TNS_DATA, Data).
 
-send_req(fetch, #oraclient{seq=Task} = State, {Cursor, RowFormat}) ->
-    Data = get_record(exec, State#oraclient{type=fetch}, {Cursor, [], [], [], RowFormat}, Task),
-    send(State, ?TNS_DATA, Data);
-send_req(fetch, #oraclient{seq=Task} = State, Cursor) ->
-    Data = get_record(fetch, State, Cursor, Task),
-    send(State, ?TNS_DATA, Data);
-send_req(exec, #oraclient{charset=Charset,fetch=Fetch,cursors=Cursors,seq=Task} = State, {Query, Bind, Batch}) ->
+send_req(fetch, #oraclient{seq=Seq} = State, {Cursor, RowFormat}) ->
+    {Data, Seq2} = get_record(exec, State#oraclient{type=fetch}, {Cursor, [], [], [], RowFormat}, Seq),
+    send(State#oraclient{seq=Seq2}, ?TNS_DATA, Data);
+send_req(fetch, #oraclient{seq=Seq} = State, Cursor) ->
+    {Data, Seq2} = get_record(fetch, State, Cursor, Seq),
+    send(State#oraclient{seq=Seq2}, ?TNS_DATA, Data);
+send_req(exec, #oraclient{charset=Charset,fetch=Fetch,cursors=Cursors,seq=Seq} = State, {Query, Bind, Batch}) ->
     {Select, Change, Bind2} = handle_bind(Query, Bind),
     {Type, Fetch2} = get_param(type, {Select, Change, [B || {out, B} <- Bind2], Fetch}),
     Sum = erlang:crc32(?ENCODER:encode_str(Query)),
     DefCol = get_param(defcols, {Sum, Cursors}),
     {LCursor, Cursor} = get_param(defcols, DefCol),
-    Pig = if Cursor =/= 0 -> get_record(pig, [], {?TTI_CANA, [Cursor]}, Task); true -> <<>> end,
-    Pig2 = if Cursor =/= 0 -> get_record(pig, [], {?TTI_OCCA, [Cursor]}, Task); true -> <<>> end,
-    Data = get_record(exec, State#oraclient{type=Type,fetch=Fetch2}, {LCursor, if LCursor =:= 0 -> Query; true -> [] end,
-        [get_param(data, B) || B <- Bind2], Batch, []}, Task),
-    send(State#oraclient{type=Type,defcols=DefCol,params=[get_param(format, B, #format{charset=Charset}) || B <- Bind2]},
+    {Pig, Seq2} = if Cursor =/= 0 -> get_record(pig, [], {?TTI_CANA, [Cursor]}, Seq); true -> {<<>>, Seq} end,
+    {Pig2, Seq3} = if Cursor =/= 0 -> get_record(pig, [], {?TTI_OCCA, [Cursor]}, Seq2); true -> {<<>>, Seq2} end,
+    {Data, Seq4} = get_record(exec, State#oraclient{type=Type,fetch=Fetch2}, {LCursor, if LCursor =:= 0 -> Query; true -> [] end,
+        [get_param(data, B) || B <- Bind2], Batch, []}, Seq3),
+    send(State#oraclient{type=Type,defcols=DefCol,params=[get_param(format, B, #format{charset=Charset}) || B <- Bind2],seq=Seq4},
         ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>).
 
 handle_resp(Acc, #oraclient{socket=Socket, sdu=Length, timeouts=Touts} = State) ->
@@ -290,14 +274,21 @@ handle_resp(Acc, #oraclient{socket=Socket, sdu=Length, timeouts=Touts} = State) 
             handle_error(Type, Reason, State)
     end.
 
+send_reset(State) ->
+    case send_req(reset, State) of
+        {ok, State2} -> State2;
+        {ok, _Reason, State2} -> State2;
+        {error, _Type, _Reason, State2} -> State2
+    end.
+
 handle_resp(Data, Acc, #oraclient{type=Type, cursors=Cursors} = State) ->
     case ?DECODER:decode_token(Data, Acc) of
         {0, _RowNumber, Cursor, {LCursor, RowFormat}, []} when Type =/= change, RowFormat =/= [] ->
             Type2 = if LCursor =:= Cursor -> Type; true -> cursor end,
             {ok, State2} = send_req(fetch, State, {Cursor, RowFormat}),
             #oraclient{defcols=DefCol} = State2,
-            {_, DefCol2} = currval(DefCol, {LCursor, Cursor, RowFormat}, Cursors),
-            handle_resp({Cursor, RowFormat, []}, State2#oraclient{defcols=DefCol2, type=Type2});
+            {_, DefCol2, Cursors2} = currval(DefCol, {LCursor, Cursor, RowFormat}, Cursors),
+            handle_resp({Cursor, RowFormat, []}, State2#oraclient{defcols=DefCol2, type=Type2, cursors=Cursors2});
         {RetCode, RowNumber, Cursor, {LCursor, RowFormat}, Rows} ->
             case get_result(Type, RetCode, RowNumber, RowFormat, Rows) of
                 more when Type =:= fetch ->
@@ -307,17 +298,19 @@ handle_resp(Data, Acc, #oraclient{type=Type, cursors=Cursors} = State) ->
                     handle_resp({Cursor, RowFormat, Rows}, State2);
                 {ok, Result} ->
                     #oraclient{defcols=DefCol} = State,
-                    case currval(DefCol, {LCursor, Cursor, RowFormat}, Cursors) of
-                        {reset, _} -> send_req(reset, State);
-                        _ -> more
+                    State3 = case currval(DefCol, {LCursor, Cursor, RowFormat}, Cursors) of
+                        {reset, _, Cursors2} ->
+                           send_reset(State#oraclient{cursors=Cursors2});
+                        {more, _, Cursors2} ->
+                           State#oraclient{cursors=Cursors2}
                     end,
-                    {ok, Result, State};
+                    {ok, Result, State3};
                 {error, Result} ->
-                    case get_result(Cursors) of
-                        [] -> more;
-                        _ -> send_req(reset, State)
+                    State2 = case get_result(Cursors) of
+                        [] -> State; % more
+                        _ -> send_reset(State)
                     end,
-                    {ok, Result, State}
+                    {ok, Result, State2}
             end;
         {ok, Result} -> %tran
             {ok, Result, State};
@@ -348,26 +341,27 @@ get_result(_Type, _RetCode, _RowNumber, _RowFormat, _Rows) ->
     more.
 
 get_result(undefined) -> [];
-get_result(Cursors) when is_pid(Cursors) -> mvar_get(Cursors);
+get_result(#cursors{v=V}) -> V;
 get_result(#format{column_name=Column}) -> Column.
 
-currval({Sum, {0, _Cursor, _RowFormat}}, Result, Cursors) when is_pid(Cursors) ->
+currval({Sum, {0, _Cursor, _RowFormat}}, Result, #cursors{} = Cursors) ->
     Acc = get_result(Cursors),
     DefCol = {Sum, Result},
     case length(Acc) > 127 of
-        true -> {reset, DefCol};
-        _ -> mvar_set(Cursors, [DefCol|Acc]), {more, DefCol}
+        true -> {reset, DefCol, Cursors};
+        _ -> {more, DefCol, #cursors{v=[DefCol|Acc]}}
     end;
-currval(DefCol, _Result, _Cursors) -> {more, DefCol}.
+currval(DefCol, _Result, Cursors) -> {more, DefCol, Cursors}.
 
-nextval(Task) when is_pid(Task) ->
-    Tseq = case mvar_get(Task) of
+nextval(#seq{v=V}) ->
+    Tseq = case V of
       127 -> 0;
       V -> V
     end,
-    mvar_set(Task, Tseq + 1),
-    Tseq + 1;
-nextval(Tseq) -> Tseq.
+    Tseq2 = Tseq + 1,
+    {Tseq2, #seq{v=Tseq2}};
+nextval(Tseq) ->
+    {Tseq, Tseq}.
 
 get_param(format, {out, Data}, Format) -> get_param(out, ?ENCODER:encode_helper(param, Data), Format);
 get_param(format, {in, Data}, Format) -> get_param(in, Data, Format);
@@ -376,7 +370,7 @@ get_param(Type, Data, Format) when is_atom(Type) ->
     {<<>>, DataType, Length, Scale, Charset} = ?DECODER:decode_helper(param, Data, Format),
     #format{param=Type,data_type=DataType,data_length=Length,data_scale=Scale,charset=Charset}.
 
-get_param(defcols, {Sum, Cursors}) when is_pid(Cursors) ->
+get_param(defcols, {Sum, #cursors{} = Cursors}) ->
     Acc = get_result(Cursors),
     {Sum, proplists:get_value(Sum, Acc, {0,0,[]})};
 get_param(defcols, {_Sum, {LCursor, Cursor, _RowFormat}}) when LCursor =:= Cursor -> {LCursor, 0};
@@ -397,10 +391,12 @@ get_param(data, {out, Data}) -> ?ENCODER:encode_helper(param, Data);
 get_param(data, {in, Data}) -> Data;
 get_param(data, Data) -> Data.
 
-get_record(Type, [], Request, Task) ->
-    ?ENCODER:encode_record(Type, #oraclient{req=Request, seq=nextval(Task)});
-get_record(Type, State, Request, Task) ->
-    ?ENCODER:encode_record(Type, State#oraclient{req=Request, seq=nextval(Task)}).
+get_record(Type, [], Request, Seq) ->
+    {Tseq, Seq2} = nextval(Seq),
+    {?ENCODER:encode_record(Type, #oraclient{req=Request, seq=Tseq}), Seq2};
+get_record(Type, State, Request, Seq) ->
+    {Tseq, Seq2} = nextval(Seq),
+    {?ENCODER:encode_record(Type, State#oraclient{req=Request, seq=Tseq}), Seq2}.
 
 sock_renegotiate(Socket, _Opts, _Touts) when is_port(Socket) -> {ok, Socket};
 sock_renegotiate(Socket, Opts, {Tout, _ReadTout}) ->
