@@ -6,7 +6,7 @@ defmodule Jamdb.Oracle.Query do
 
   """
 
-  defstruct [:statement, :name, :batch]  
+  defstruct [:statement, :name, :batch, :returning_out]
 
   @parent_as __MODULE__
   alias Ecto.Query.{BooleanExpr, JoinExpr, QueryExpr, WithExpr}
@@ -81,7 +81,14 @@ defmodule Jamdb.Oracle.Query do
         [?\s, ?(, intersperse_map(header, ?,, &quote_name/1), ?), ?\s | from]
       end
 
-    ["INSERT INTO ", quote_table(prefix, table), values | returning(returning)]
+    sql = ["INSERT INTO ", quote_table(prefix, table), values | returning(returning)]
+
+    %Jamdb.Oracle.Query{
+      statement: IO.iodata_to_binary(sql),
+      # TODO: not general at all; depends on the types of the columns returned; assuming it is the id, and id is integer here:
+      # but it gets assocition inserts working for us.
+      returning_out: Enum.map(returning, fn _ -> :integer end)
+    }
   end
 
   defp insert_all(query = %Ecto.Query{}, _counter) do
