@@ -435,8 +435,9 @@ recv(read_timeout, Socket, Length, {_Tout, ReadTout} = Touts, Acc, Data) ->
     case sock_recv(Socket, 0, ReadTout) of
         {ok, NetworkData} ->
             recv(Socket, Length, Touts, <<Acc/bits, NetworkData/bits>>, Data);
-        {error, timeout} ->
-            {ok, ?TNS_DATA, Data};
+        % this causes weird protocol decoding errors, and seems wrong:
+        % {error, timeout} ->
+        %     {ok, ?TNS_DATA, Data};
         {error, Reason} ->
             {error, socket, Reason}
     end.
