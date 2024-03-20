@@ -57,13 +57,9 @@ defmodule Jamdb.Oracle do
   end
 
   defp sql_query(conn, query, timeout) do
-    try do
-      case :jamdb_oracle_conn.sql_query(conn, query, timeout) do
-        {:ok, result, conn} -> {:ok, result, conn}
-        {:error, _, err, conn} -> {:error, err, conn}
-      end
-    catch
-      _, err -> {:error, err, conn}
+    case :jamdb_oracle_conn.sql_query(conn, query, timeout) do
+      {:ok, result, conn} -> {:ok, result, conn}
+      {:error, _, err, conn} -> {:error, err, conn}
     end
   end
 
